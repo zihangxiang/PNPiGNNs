@@ -1,4 +1,5 @@
-# On Preserving Node-level Privacy in Graph Neural Networks
+# Preserving Node-level Privacy in Graph Neural Networks
+Accepted by IEEE S&P 2024
 
 ## 1. Running Environment
 Install all packages as specified in `requirements.txt`.
