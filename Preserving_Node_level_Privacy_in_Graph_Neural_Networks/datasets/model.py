@@ -13,8 +13,6 @@ criterion = torch.nn.CrossEntropyLoss()
 class G_net(torch.nn.Module):
     def __init__(self, K, feat_dim, num_classes, hidden_channels):
         super().__init__()
-        # self.conv1 = GCNConv(dataset_example.num_features, hidden_channels, )
-        # self.conv2 = GCNConv(hidden_channels, dataset_example.num_classes, )
         assert isinstance(K, int)
         assert K >=1
 
@@ -30,9 +28,7 @@ class G_net(torch.nn.Module):
         for i in range(len(self.conv_list)):
             out = self.conv_list[i](out)
 
-        # out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True)+ 1e-6)
         out = (out - torch.mean(out)) / (torch.std(out) + 1e-6)
-        # out = NL(out)
 
         return self.classifier(out)
 
@@ -47,7 +43,6 @@ class GCN(torch.nn.Module):
         out = torch.sum(x, dim=0, keepdim=True) / (norm > 0).sum()
         out = NL(out)
 
-        # out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True)+ 1e-6)
         out = (out - torch.mean(out)) / (torch.std(out) + 1e-6)
         out = NL(out)
         out = self.post_process(out)
@@ -68,13 +63,10 @@ class GCN(torch.nn.Module):
 class GIN(torch.nn.Module):
     def __init__(self, input_feat_dim, output_feat_dim):
         super().__init__()    
-        # self.pre_process = torch.nn.Linear(input_feat_dim, output_feat_dim)
         self.GIN_eps = torch.nn.parameter.Parameter(torch.Tensor([1]))
         self.post_process = torch.nn.Linear(input_feat_dim, output_feat_dim)
-        # self.linear_2 = torch.nn.Linear(output_feat_dim, output_feat_dim)
-    def forward(self, x):
-        # out = torch.matmul(adj + torch.eye(adj.shape[0], device=x.device) * (1 + self.GIN_eps), x) #/ adj.sum(dim=1, keepdim=True)
 
+    def forward(self, x):
         out = torch.sum(x, dim=0, keepdim=True)
         out = NL(out)
 

@@ -25,8 +25,6 @@ def setup_seed(seed):
     
 
 def init_model_para(model):
-    # return
-    # setup_seed(1234)
     for layer in model.modules():
         if isinstance(layer, nn.Linear):
             nn.init.xavier_normal_(layer.weight)

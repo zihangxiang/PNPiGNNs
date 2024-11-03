@@ -13,8 +13,6 @@ class subgraph_sampler(Dataset):
         num_neighbors = None, 
         neighbor_num_constrain_for_training_for_memory = None,
         out_degree_inverse = None,
-        # num_not_neighbors = None, 
-        # not_neighbor_num_constrain_for_training_for_memory = 500,
 
         graph_data = None, 
         graph_data_name = None,
@@ -55,7 +53,6 @@ class subgraph_sampler(Dataset):
         assert self.setting in ['transductive', 'inductive']
         assert self.dataset_mode in ['train', 'val', 'test']
 
-        # print(f'\n==> total mask size = {self.mask.numel()}, type of mask = {self.mask.dtype}')
         ''' storing the neighbors of each node in the graph '''
         ''' check if the cache file exists, if so, load it, or else, create it '''
         file_name = f'{self.graph_data_name}_{self.setting}_{self.dataset_mode}_{self.args.seed}_{self.neighbor_num_constrain_for_training_for_memory}.pt'
@@ -71,14 +68,12 @@ class subgraph_sampler(Dataset):
 
             self.init_ids()
             assert len(self.dict_of_nodes_neighbors) == len(self.ids_for_legit_rest_nodes_in_graph)
-            # assert len(self.dict_of_nodes_not_neighbors) == len(self.ids_for_legit_rest_nodes_in_graph)
             
         else:
             self.init_ids()
 
             print(f'==> concluding the neighbors of each node in the graph, it may take a while...')
             self.dict_of_nodes_neighbors = {}
-            # self.dict_of_nodes_not_neighbors = {}
 
             source_nodes = self.graph_edge_index[0, :].cuda()
             neighbor_nodes = self.graph_edge_index[1, :].cuda()
@@ -103,16 +98,12 @@ class subgraph_sampler(Dataset):
                 # self.dict_of_nodes_not_neighbors[node] = not_neighbors[torch.randperm(not_neighbors.numel())].cpu()
 
             del source_nodes, neighbor_nodes, mask
-            # data = [self.dict_of_nodes_neighbors, self.dict_of_nodes_not_neighbors, self.mask]
-
             data = [self.dict_of_nodes_neighbors, self.mask]
             torch.save(data, file_path)
             print(f'==> file saved to: {file_path}')
 
-        # print(f'\n==> setting = {self.setting}, dataset_mode = {self.dataset_mode}, K = {self.K}, num_neighbors = {self.num_neighbors}, num_not_neighbors = {self.num_not_neighbors}, neighbor_num_constrain_for_training = {self.neighbor_num_constrain_for_training}, not_neighbor_num_constrain_for_training_for_memory = {self.not_neighbor_num_constrain_for_training_for_memory}')
         print(f'-> setting: {self.setting}, mode: {self.dataset_mode}')
         print(f'-> graph dataset contains {self.mask.numel()}')
-        # print(f'-> one sample is on {self.K * (self.num_neighbors + self.num_not_neighbors) + 1} nodes')
         print(f'-> number of usable nodes: {self.ids_for_all_legit_starting_nodes.numel()}')
         print(f'-> number of rest legit nodes: {self.rest_legit_node_num}')
         print(f'==> done, time elapsed = {time.time() - s:.4f} seconds')
@@ -363,10 +354,6 @@ class sr_calculator:
 
 
 if __name__ == "__main__":
-    # print( rate(nodes_at_which_hop = 4) )
-    pass
-    # print( rate_of_sampled_the_node(q = batch_size / N, K = K) )
-
     cal = sr_calculator(
             batch_size = 128,
             N = 13752,

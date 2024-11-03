@@ -22,7 +22,6 @@ for num_not_neighbors in 1
 do
 for seed in {1,2,3,4,5}
 do
-# for dataset in {Amazon_Computers,Amazon_Photo,Reddit,PubMed,Coauthor_Physics}
 for dataset in {facebook,twitch_DE,Reddit,Amazon_Computers,PubMed}
 do
 
