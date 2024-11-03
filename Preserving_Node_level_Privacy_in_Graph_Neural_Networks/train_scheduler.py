@@ -284,11 +284,7 @@ class trainer:
         for p_model, p_per in zip(self.model.parameters(), per_grad):
             p_model.grad = torch.mean(p_per, dim=0)
             ''' add noise to gradients'''
-            # noise_std = 3
-            ''''''
-            # p_model.grad = p_model.grad + torch.randn_like(p_model.grad) * self.std * self.args.C / p_per.shape[0]
-
-            '''laplacian noise'''
+            '''symmetric multivariate Laplace noise'''
             p_model.grad = p_model.grad + torch.randn_like(p_model.grad) * self.std * self.args.C / p_per.shape[0] * sq_w
             
 
