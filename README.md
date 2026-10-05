@@ -1,8 +1,7 @@
 # Preserving Node-level Privacy in Graph Neural Networks
 
 Code for the IEEE S&P 2024 paper *Preserving Node-level Privacy in Graph Neural Networks*.
-It trains GNNs with node-level differential privacy: removing any single node,
-together with all its edges, changes the output distribution by at most (ε, δ).
+It trains GNNs with node-level differential privacy.
 
 ## How it works
 
