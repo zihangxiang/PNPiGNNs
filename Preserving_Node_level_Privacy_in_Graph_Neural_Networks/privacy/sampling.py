@@ -1,285 +1,180 @@
-import torch
-import numpy as np
-from torch.utils.data import DataLoader, Dataset
-import time
+"""Subgraph sampling for node-level DP training (Figure 3 of the paper).
+
+Every example is a small subgraph around a *root* node ``r``:
+
+* **train**: roots are the training nodes, Poisson-sampled with rate
+  ``q = expected_batchsize / num_train_nodes`` (:class:`PoissonSampler`).
+  Each neighbour ``u`` of ``r`` (``r -> u`` in ``edge_index``) is kept
+  independently with probability ``num_neighbors / d_out(u)``, where
+  ``d_out(u)`` is the number of distinct nodes with an edge into ``u``, i.e.
+  the number of roots that can pick ``u``. Neighbours may be any node
+  (transductive) or only training nodes (inductive).
+* **test**: roots are the test nodes. At most ``num_neighbors`` neighbours
+  are drawn uniformly without replacement, from test nodes only.
+
+A root without (admissible) neighbours instead gets ``num_neighbors`` nodes
+drawn uniformly with replacement from the admissible nodes. Each of the ``K``
+sampling rounds samples neighbours of the root again.
+"""
 import os
-import torch_geometric
+import time
+from functools import partial
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-class subgraph_sampler(Dataset):
-    def __init__(self, 
-        K = None, 
 
-        num_neighbors = None, 
-        neighbor_num_constrain_for_training_for_memory = None,
-        out_degree_inverse = None,
+class SubgraphSampler(Dataset):
+    """Dataset of sampled subgraphs; item ``i`` is rooted at the ``i``-th node of ``mask``.
 
-        graph_data = None, 
-        graph_data_name = None,
+    Args:
+        K: Number of neighbour-sampling rounds.
+        num_neighbors: Neighbour budget (see module docstring).
+        graph_data: The whole graph (``torch_geometric.data.Data``-like with ``x``, ``y``, ``edge_index``).
+        graph_data_name: Name used for cache files and logging.
+        mask: Boolean node mask selecting the roots (train or test split).
+        setting: ``'transductive'`` or ``'inductive'``.
+        dataset_mode: ``'train'`` or ``'test'``.
+        seed: Seed of the run; part of the cache-file name because the split depends on it.
+        cache_file_path: Directory for the cached neighbour lists.
+        out_degree_inverse: ``1 / d_out(u)`` per node (training only).
+        max_neighbors_train: Only the first this-many admissible neighbours of a
+            node (in ``edge_index`` order) are kept in training, to bound memory.
+    """
 
-        mask = None,
-        setting = None,
-        dataset_mode = None,
-        device = 'cpu',
-
-        args = None,
-        cache_file_path = None,
-        ):
+    def __init__(self, *, K, num_neighbors, graph_data, graph_data_name, mask, setting,
+                 dataset_mode, seed, cache_file_path, out_degree_inverse=None, max_neighbors_train=None):
         super().__init__()
-        s = time.time()
+        assert setting in ('transductive', 'inductive')
+        assert dataset_mode in ('train', 'test')
+        start = time.time()
+        print(f'\n\n{"=" * 40}\ndataset init...')
 
-        print(f'\n\n{"="*40}\ndataset init...')
-        self.K = K 
+        self.K = K
         self.num_neighbors = num_neighbors
-        self.neighbor_num_constrain_for_training_for_memory = neighbor_num_constrain_for_training_for_memory
-        self.out_degree_inverse = out_degree_inverse
-
-        ''' input graph_data is a torch_geometric.data.Data object, it is the whole graph'''
         self.graph_data = graph_data
         self.graph_data_name = graph_data_name
-
-        self.args = args
-        self.cache_file_path = cache_file_path
-
-        self.device = device
-        self.graph_edge_index = self.graph_data.edge_index.to(device)
-
-        ''' for what type of node, it is determined by the mask '''
-        self.mask = mask.to(device)
-       
+        self.mask = mask
         self.setting = setting
         self.dataset_mode = dataset_mode
+        self.out_degree_inverse = out_degree_inverse
+        self.max_neighbors_train = max_neighbors_train
 
-        assert self.setting in ['transductive', 'inductive']
-        assert self.dataset_mode in ['train', 'val', 'test']
-
-        ''' storing the neighbors of each node in the graph '''
-        ''' check if the cache file exists, if so, load it, or else, create it '''
-        file_name = f'{self.graph_data_name}_{self.setting}_{self.dataset_mode}_{self.args.seed}_{self.neighbor_num_constrain_for_training_for_memory}.pt'
-        file_path = self.cache_file_path / file_name
-        os.mkdir(self.cache_file_path) if not os.path.exists(self.cache_file_path) else None
-
+        # Cached: {node: shuffled admissible neighbours} and the mask they were built with.
+        file_name = f'{graph_data_name}_{setting}_{dataset_mode}_{seed}_{max_neighbors_train}.pt'
+        file_path = cache_file_path / file_name
+        os.makedirs(cache_file_path, exist_ok=True)
         if os.path.exists(file_path):
-            print(f'==> loading the neighbors of each node in the graph...')
-            data = torch.load(file_path)
-
-            self.dict_of_nodes_neighbors = data[0]
-            self.mask = data[1]
-
-            self.init_ids()
-            assert len(self.dict_of_nodes_neighbors) == len(self.ids_for_legit_rest_nodes_in_graph)
-            
+            print('==> loading the neighbors of each node in the graph...')
+            self.neighbors, self.mask = torch.load(file_path)
+            self._init_ids()
+            assert len(self.neighbors) == len(self.admissible_nodes)
         else:
-            self.init_ids()
-
-            print(f'==> concluding the neighbors of each node in the graph, it may take a while...')
-            self.dict_of_nodes_neighbors = {}
-
-            source_nodes = self.graph_edge_index[0, :].cuda()
-            neighbor_nodes = self.graph_edge_index[1, :].cuda()
-            mask = self.mask.cuda()
-
-            self.ids_for_legit_rest_nodes_in_graph_device = self.ids_for_legit_rest_nodes_in_graph.cuda().reshape(-1)
-
-            ''' shuffle the source_nodes and neighbor_nodes'''
-            for node in tqdm(self.ids_for_legit_rest_nodes_in_graph):
-                node = int(node)
-                ''' get the neighbors of node '''
-                neighbors = neighbor_nodes[ source_nodes == node ]
-
-                ''' filter the neighbors of node '''
-                neighbors = self.filter_to_be_legit_nodes(neighbors, mask)
-
-                if self.dataset_mode == 'train':
-                    neighbors = neighbors[ :self.neighbor_num_constrain_for_training_for_memory ]
-                ''' store the neighbors of node '''
-                self.dict_of_nodes_neighbors[node] = neighbors[torch.randperm(neighbors.numel())].cpu() 
-                ''' store the not neighbors of node '''
-                # self.dict_of_nodes_not_neighbors[node] = not_neighbors[torch.randperm(not_neighbors.numel())].cpu()
-
-            del source_nodes, neighbor_nodes, mask
-            data = [self.dict_of_nodes_neighbors, self.mask]
-            torch.save(data, file_path)
+            self._init_ids()
+            print('==> concluding the neighbors of each node in the graph, it may take a while...')
+            self.neighbors = self._build_neighbor_lists()
+            torch.save([self.neighbors, self.mask], file_path)
             print(f'==> file saved to: {file_path}')
 
         print(f'-> setting: {self.setting}, mode: {self.dataset_mode}')
         print(f'-> graph dataset contains {self.mask.numel()}')
-        print(f'-> number of usable nodes: {self.ids_for_all_legit_starting_nodes.numel()}')
-        print(f'-> number of rest legit nodes: {self.rest_legit_node_num}')
-        print(f'==> done, time elapsed = {time.time() - s:.4f} seconds')
-        print(f'{"="*40}')
+        print(f'-> number of usable nodes: {self.root_ids.numel()}')
+        print(f'-> number of rest legit nodes: {self.num_admissible}')
+        print(f'==> done, time elapsed = {time.time() - start:.4f} seconds')
+        print('=' * 40)
 
-    def init_ids(self):
-        self.ids_for_all_legit_starting_nodes = self.mask.nonzero(as_tuple=True)[0]
-        self.num_of_nodes =int(self.ids_for_all_legit_starting_nodes.numel())
+    @property
+    def _neighbors_restricted_to_mask(self):
+        return not (self.setting == 'transductive' and self.dataset_mode == 'train')
 
-        if self.setting == 'transductive' and self.dataset_mode == 'train':
-            self.ids_for_legit_rest_nodes_in_graph = torch.arange(self.mask.numel(), device = self.device)
-        elif self.setting == 'inductive' and self.dataset_mode == 'train':
-            self.ids_for_legit_rest_nodes_in_graph = self.mask.nonzero(as_tuple=True)[0].to(self.device)
-        elif self.dataset_mode in ['val', 'test']:
-            self.ids_for_legit_rest_nodes_in_graph = self.mask.nonzero(as_tuple=True)[0].to(self.device)
+    def _init_ids(self):
+        self.root_ids = self.mask.nonzero(as_tuple=True)[0]
+        # nodes allowed to appear as non-root members of a subgraph
+        if self._neighbors_restricted_to_mask:
+            self.admissible_nodes = self.mask.nonzero(as_tuple=True)[0]
         else:
-            raise NotImplementedError
-        
-        self.rest_legit_node_num = self.ids_for_legit_rest_nodes_in_graph.numel()
+            self.admissible_nodes = torch.arange(self.mask.numel())
+        self.num_admissible = self.admissible_nodes.numel()
 
-    def filter_to_be_legit_nodes(self, nodes, mask):
-        if self.setting == 'transductive' and self.dataset_mode == 'train':
-            pass
-        elif self.setting == 'inductive' and self.dataset_mode == 'train':
-            nodes = nodes[mask[nodes] == True]
-        elif self.dataset_mode in ['val', 'test']:
-            nodes = nodes[mask[nodes] == True]
-        else:
-            raise NotImplementedError
-        return nodes
+    def _build_neighbor_lists(self):
+        """``{node: admissible out-neighbours in random order}`` for every admissible node."""
+        source_nodes, neighbor_nodes = self.graph_data.edge_index
+        # group targets by source, keeping edge_index order within each group
+        source_sorted, order = torch.sort(source_nodes, stable=True)
+        neighbors_of = torch.split(
+            neighbor_nodes[order],
+            torch.bincount(source_sorted, minlength=self.mask.numel()).tolist(),
+        )
+
+        neighbors = {}
+        for node in tqdm(self.admissible_nodes.tolist()):
+            node_neighbors = neighbors_of[node]
+            if self._neighbors_restricted_to_mask:
+                node_neighbors = node_neighbors[self.mask[node_neighbors]]
+            if self.dataset_mode == 'train':
+                node_neighbors = node_neighbors[:self.max_neighbors_train]
+            neighbors[node] = node_neighbors[torch.randperm(node_neighbors.numel())]
+        return neighbors
 
     def __len__(self):
-        return self.num_of_nodes
+        return self.root_ids.numel()
 
-    def __getitem__(self, mapped_root_node):
-        '''
-        # root_node: int, the root/starting node of the subgraph
-        # return: x, edge_index, y
-        #         x: torch.tensor, shape = (K * 2 + 1, num_node_features)
-        #         edge_index: torch.tensor, shape = (2, K * 2 ), node id starts from 0 to K * 2 + 1
-        #         y: torch.tensor, shape = (K * 2 + 1, )
-        '''
-        # start_time = time.time()
-        root_node = int(self.ids_for_all_legit_starting_nodes[mapped_root_node])
+    def __getitem__(self, index):
+        """Returns ``(x, y_root, nodes, in_mask)`` of one subgraph.
 
-        sub_graph_nodes = [root_node]
-        sub_graph_edge_index = []
-
-        for i in range(1, self.K+1):
-            ''' action for depth '''
-            '''1. sample neighbors'''
-            all_neighbors = self.dict_of_nodes_neighbors[root_node]
-            if all_neighbors.numel() == 0:
-                # print(f'==> root_node = {root_node}, dataset_mode = {self.dataset_mode}, no neighbors')
-                ''' 1 random spot '''
-                sampled_neighbors = self.ids_for_legit_rest_nodes_in_graph[ np.random.choice(self.rest_legit_node_num, self.num_neighbors, replace=True).tolist() ]
-                # sampled_neighbors = self.ids_for_legit_rest_nodes_in_graph[ np.random.choice(self.rest_legit_node_num, 1, replace=True).tolist() ]
+        ``nodes[0]`` is the root, ``x = features[nodes]``, ``y_root`` has shape
+        ``(1,)`` and ``in_mask = mask[nodes]``.
+        """
+        root = int(self.root_ids[index])
+        nodes = [root]
+        for _ in range(self.K):
+            root_neighbors = self.neighbors[root]
+            if root_neighbors.numel() == 0:
+                picked = np.random.choice(self.num_admissible, self.num_neighbors, replace=True)
+                sampled = self.admissible_nodes[picked.tolist()]
+            elif self.dataset_mode == 'test':
+                num = min(root_neighbors.numel(), self.num_neighbors)
+                picked = np.random.choice(root_neighbors.numel(), num, replace=False)
+                sampled = root_neighbors[picked.tolist()]
             else:
-                ''' 2 random spot '''
-                if self.dataset_mode == 'test':
-                    ''''''
-                    num_neighbors = min(all_neighbors.numel(), self.num_neighbors)
-                    sampled_neighbors = all_neighbors[ np.random.choice(all_neighbors.numel(), num_neighbors, replace=False).tolist() ]
+                keep_prob = self.out_degree_inverse[root_neighbors] * self.num_neighbors
+                sampled = root_neighbors[torch.rand(root_neighbors.numel()) <= keep_prob]
+            nodes += sampled.tolist()
 
-                else:
-                    # print(222, self.out_degree_inverse, self.out_degree_inverse[self.out_degree_inverse>0])
-                    p = self.out_degree_inverse[all_neighbors] * self.num_neighbors
-                    tester = torch.rand(all_neighbors.numel())
-                    sampled_neighbors = all_neighbors[ tester<=p ]
-
-            tmp_neighbors_of_root = sampled_neighbors.tolist()
-            sub_graph_nodes += tmp_neighbors_of_root
-
-            center_node = [root_node] * ( len(sampled_neighbors) )
-            sub_graph_edge_index.append(
-                torch.tensor(
-                    [
-                        center_node,           #+ tmp_neighbors_of_root,
-                        tmp_neighbors_of_root #+ center_node,
-                    ], 
-                    dtype = self.graph_edge_index.dtype,
-                )
-
-            )
+        nodes = torch.tensor(nodes, dtype=self.graph_data.edge_index.dtype)
+        return self.graph_data.x[nodes], self.graph_data.y[nodes][:1], nodes, self.mask[nodes]
 
 
-        sub_graph_nodes = torch.tensor(sub_graph_nodes, dtype=self.graph_edge_index.dtype)
+def collate_subgraphs(batch, drop_seen_roots):
+    """Zero-pads subgraphs to a common size: returns ``x (B, max_nodes, F)`` and ``y (B, 1)``.
 
-        return [ 
-                self.graph_data.x[sub_graph_nodes], 
-                0, 
-                # self.graph_data.y[sub_graph_nodes].reshape(-1), 
-                self.graph_data.y[sub_graph_nodes][:1], 
-                sub_graph_nodes, 
-                0, 
-                0, 
-                self.dataset_mode,
-                self.mask[sub_graph_nodes],
-                ] 
+    With ``drop_seen_roots`` (training), a non-root node that is in the mask and
+    is the root of an earlier subgraph of the batch is removed.
+    """
+    xs = [x for x, _, _, _ in batch]
+    if drop_seen_roots:
+        seen_roots = set()
+        for i, (x, _, nodes, in_mask) in enumerate(batch):
+            nodes = nodes.tolist()
+            keep = [0] + [j for j in range(1, len(nodes)) if not (nodes[j] in seen_roots and in_mask[j])]
+            xs[i] = x[keep]
+            seen_roots.add(nodes[0])
 
-def collate_subgraphs(batch):
-    # overlapping = 0
+    max_nodes = max(x.shape[0] for x in xs)
+    padded = []
+    for x in xs:
+        x_pad = torch.zeros(max_nodes, x.shape[1])
+        x_pad[:x.shape[0], :] = x
+        padded.append(x_pad)
+    return torch.stack(padded, dim=0), torch.stack([y for _, y, _, _ in batch], dim=0)
 
-    sub_graph_nodes_set = set()
-
-    ''' processing for train mode '''
-    if batch[0][6] == 'train':
-        index_to_keep = []
-        for i in range(len(batch)):
-            current_nodes = batch[i][3].tolist()
-            index_to_keep.append([0])
-            for j in range(1, len(current_nodes)):
-                if current_nodes[j] in sub_graph_nodes_set and batch[i][7][j] == True:
-                    # overlapping += 1
-                    pass
-                    # batch[i][0][j] = torch.zeros_like(batch[i][0][j])
-                else:
-                    index_to_keep[i].append(j)
-            sub_graph_nodes_set.add(current_nodes[0])
-
-        for i in range(len(batch)):
-            batch[i][0] = batch[i][0][index_to_keep[i]]
-
-    ''' find the max x.shape[0] '''
-    max_x_shape = 0
-    for i in range(len(batch)):
-        max_x_shape = max(max_x_shape, batch[i][0].shape[0])
-
-    ''''''
-    x = []
-    # adj = []
-    y = []
-
-    for i in range(len(batch)):
-        x_tmp = torch.zeros(max_x_shape, batch[i][0].shape[1])
-        x_tmp[:batch[i][0].shape[0], :] = batch[i][0]
-        x.append(x_tmp)
-
-        y.append(batch[i][2])
-    
-    x = torch.stack(x, dim=0)
-    y = torch.stack(y, dim=0)
-    
-    # print(f'==> # total: {len(sub_graph_nodes_set)}, # overlapping: {overlapping}, # central: {len(batch)}, {overlapping / len(batch) * 100:.2f}%, {batch[0][6]}')
-    return x, y
-
-def get_subgraphs_loader(train_dataset, expected_batchsize, worker_num = 4, drop_last = True, dataset_mode = 'train'):
-    assert expected_batchsize <= len(train_dataset), f'expected_batchsize = {expected_batchsize} > {len(train_dataset)}'
-    '''poisson sampling'''
-    if dataset_mode == 'train':
-        print(f'==> initializing {dataset_mode} dataloader')
-        return DataLoader(
-            dataset = train_dataset,
-            batch_sampler = PoissonSampler(len(train_dataset), expected_batchsize),
-            num_workers = worker_num,
-            pin_memory = True,
-            # drop_last = drop_last,
-            collate_fn = collate_subgraphs,
-            persistent_workers = True,
-        )
-    else:
-
-        ''' normal loader '''
-        print(f'==> initializing {dataset_mode} dataloader')
-        return DataLoader(
-                    dataset = train_dataset,
-                    batch_size = expected_batchsize,
-                    shuffle = True,
-                    num_workers = worker_num,
-                    pin_memory = True,
-                    drop_last = drop_last,
-                    collate_fn = collate_subgraphs,
-                    persistent_workers = True,
-                )
 
 class PoissonSampler(torch.utils.data.Sampler):
+    """Yields ``ceil(n / batch_size)`` batches per epoch; each index is in a
+    batch independently with probability ``batch_size / n``."""
+
     def __init__(self, num_examples, batch_size):
         self.inds = np.arange(num_examples)
         self.batch_size = batch_size
@@ -288,10 +183,9 @@ class PoissonSampler(torch.utils.data.Sampler):
         super().__init__(None)
 
     def __iter__(self):
-        # select each data point independently with probability `sample_rate`
-        for i in range(self.num_batches):
+        for _ in range(self.num_batches):
             batch_idxs = np.random.binomial(n=1, p=self.sample_rate, size=len(self.inds))
-            batch = self.inds[batch_idxs.astype(np.bool)]
+            batch = self.inds[batch_idxs.astype(bool)]
             np.random.shuffle(batch)
             yield batch
 
@@ -299,69 +193,18 @@ class PoissonSampler(torch.utils.data.Sampler):
         return self.num_batches
 
 
-class sr_calculator:
-    def __init__(self, 
-        *,
-        batch_size,
-        N,
-        K,
-        min_in_degree,
-        max_out_degree,
-        num_neighbors,
-        num_not_neighbors = None,
-    ):
-        self.batch_size = batch_size
-        self.N = N
-        self.K = K
-        self.min_in_degree = min_in_degree
-        self.max_out_degree = max_out_degree
-        self.num_neighbors = num_neighbors
-        self.num_not_neighbors = num_not_neighbors
-        self.q = self.batch_size / self.N
-        
-    def calculate(self):
-
-        sr_one_node = []
-        for i in range(self.N):
-            sr_one_node.append(self.sr_of_node_i(i))
-
-        final_prob = self.union_prob(sr_one_node)
-        assert final_prob <= 1,  f"final_prob {final_prob} is larger than 1"
-        return final_prob, final_prob / self.q
-
-    def sr_of_node_i(self, i):
-        if i == 0:
-            return self.q
-        elif i <= self.max_out_degree:
-            return self.q * self.total_prob(
-                                self.num_neighbors / self.min_in_degree,
-                                1,
-                                0
-                            )
-        else: 
-            return 0
-            
-    @staticmethod
-    def total_prob(prob_1, prob_2_when_1_happen, prob_3_when_1_not_happen):
-        return prob_1 * prob_2_when_1_happen + (1 - prob_1) * prob_3_when_1_not_happen
-    @staticmethod
-    def union_prob(probs):
-        results = 1
-        for prob in probs:
-            results = results * (1 - prob)
-        return 1 - results
-
-
-
-if __name__ == "__main__":
-    cal = sr_calculator(
-            batch_size = 128,
-            N = 13752,
-            K = 1,
-            min_in_degree = 18,
-            max_out_degree = 20,
-            num_neighbors = 10,
-            # num_not_neighbors = 10,
-        )
-
-    print(cal.calculate())
+def get_subgraphs_loader(dataset, expected_batchsize, worker_num=4):
+    """Poisson-sampled loader for a train sampler, shuffled fixed-size batches otherwise."""
+    assert expected_batchsize <= len(dataset), f'expected_batchsize = {expected_batchsize} > {len(dataset)}'
+    is_train = dataset.dataset_mode == 'train'
+    print(f'==> initializing {dataset.dataset_mode} dataloader')
+    common = dict(
+        dataset=dataset,
+        num_workers=worker_num,
+        pin_memory=True,
+        collate_fn=partial(collate_subgraphs, drop_seen_roots=is_train),
+        persistent_workers=True,
+    )
+    if is_train:
+        return DataLoader(batch_sampler=PoissonSampler(len(dataset), expected_batchsize), **common)
+    return DataLoader(batch_size=expected_batchsize, shuffle=True, drop_last=False, **common)

@@ -1,304 +1,171 @@
-# from scipy.special import binom
-from scipy.stats import binom
-import torch
-import numpy as np
+r"""Node-level privacy accountant (Theorem 2 of the paper).
+
+Training privatises the sum of per-subgraph gradients, each clipped to norm
+``C / 2``, with Gaussian noise of std ``sigma * C`` (see ``train_scheduler.py``).
+Subgraph roots are Poisson-sampled with rate ``q``, and a node ``u`` with
+``d_out`` potential roots joins a sampled root's subgraph with probability
+``M_train / d_out`` (see ``privacy/sampling.py``).
+
+From the point of view of one node, one training step is modelled as the
+Gaussian mixture ``P = sum_i w_i N(s_i / sigma, 1)`` against ``Q = N(0, 1)``
+(in units of ``C``), with components
+
+* ``s = 1/2``, ``w = q``: the node is sampled as a root;
+* ``s = n``,   ``w = (1 - q) * Binom(n; d_out, q * M_train / d_out)``,
+  ``n = 0..d_out``: the node appears as a neighbour in ``n`` subgraphs.
+
+The per-step Renyi divergence ``max(D_a(P||Q), D_a(Q||P))`` is computed by
+numerical integration, composed over all steps, converted to
+``(epsilon, delta)``-DP, and evaluated at the worst-case ``d_out`` in
+``1..D_out``.
+
+Example (run from the project directory)::
+
+    python -m privacy.mix
+"""
 import math
 import time
-import os
-from tqdm import tqdm
 from pathlib import Path
-import sys
-import os
-# import scipy    
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import torch
+
+from privacy.accounting_analysis import cached_std, get_privacy_spent
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-dtype_float = torch.float64
-dtype_int = torch.int32
+DTYPE = torch.float64
 
-import privacy.distribution as distribution
+# RDP orders. Built as a float32 tensor, so each order is used (consistently)
+# at its float32 value.
+ALPHAS = torch.tensor([1 + x / 10.0 for x in range(1, 100)] + list(range(12, 30))).numpy()
+STD_NORMAL = torch.distributions.normal.Normal(0, 1)
+# Mixture components whose (normalised) log-weight is below this are dropped.
+LOG_WEIGHT_CUTOFF = -30
+# Grid in CDF space of N(0, 1): integrating f(Phi^-1(t)) dt over (0, 1) is E_{x~N(0,1)}[f(x)].
+GRID_EPS = 1e-8
+GRID_POINTS = int(1e6)
+# (alpha, sigma) at which the worst-case d_out is selected.
+WORST_CASE_ALPHA, WORST_CASE_SIGMA = 1.3, 1
 
-def log_factorial(n):
-    return torch.lgamma(n + 1)
 
-def eps_from_delta_rdp(orders, rdp, delta):
-    r"""Computes epsilon given a list of Renyi Differential Privacy (RDP) values at
-    multiple RDP orders and target ``delta``.
-    The computation of epslion, i.e. conversion from RDP to (eps, delta)-DP,
-    is based on the theorem presented in the following work:
-    Borja Balle et al. "Hypothesis testing interpretations and Renyi differential privacy."
-    International Conference on Artificial Intelligence and Statistics. PMLR, 2020.
-    Particullary, Theorem 21 in the arXiv version https://arxiv.org/abs/1905.09982.
+def _normalize_log(log_values, log_dx):
+    """Shifts ``log_values`` so that ``sum(exp(log_values + log_dx)) == 1``."""
+    return log_values - torch.logsumexp(log_values + log_dx, dim=0)
+
+
+class NodeDPAccountant:
+    """Node-level RDP accountant for subgraph-sampled DP-SGD.
+
     Args:
-        orders: An array (or a scalar) of orders (alphas).
-        rdp: A list (or a scalar) of RDP guarantees.
-        delta: The target delta.
-    Returns:
-        Pair of epsilon and optimal order alpha.
-    Raises:
-        ValueError
-            If the lengths of ``orders`` and ``rdp`` are not equal.
+        q: Poisson sampling rate of root nodes (``expected_batchsize / num_roots``).
+        num_steps: Number of noisy gradient steps taken in training.
+        D_out: Largest ``d_out`` (number of potential roots of a node) considered.
+        M_train: Neighbour-sampling budget ``M`` used in training (``--num_neighbors``).
     """
-    orders_vec = np.atleast_1d(orders)
-    rdp_vec = np.atleast_1d(rdp)
 
-    if len(orders_vec) != len(rdp_vec):
-        raise ValueError(
-            f"Input lists must have the same length.\n"
-            f"\torders_vec = {orders_vec}\n"
-            f"\trdp_vec = {rdp_vec}\n"
-        )
-
-    eps = (
-        rdp_vec
-        - (np.log(delta) + np.log(orders_vec)) / (orders_vec - 1)
-        + np.log((orders_vec - 1) / orders_vec)
-    )
-
-    # special case when there is no privacy
-    if np.isnan(eps).all():
-        return np.inf, np.nan
-
-    idx_opt = np.nanargmin(eps)  # Ignore NaNs
-    # print(f'best alpha: {orders_vec[idx_opt]}')
-
-    return eps[idx_opt], orders_vec[idx_opt]
-
-
-class divergence_computer:
-    def __init__(self, q_b, epoch, D_out, M_train = 1, saving_path = None):
-        # self.noise_sigma = noise_sigma
-        assert q_b >= 0 and q_b <= 1, f'q_b should be in (0, 1), but got {q_b}'
+    def __init__(self, q, num_steps, D_out, M_train=1):
+        assert 0 <= q <= 1, f'q should be in [0, 1], but got {q}'
         assert D_out > 0, f'D_out should be greater than 0, but got {D_out}'
-
-        self.q_b = q_b
-        self.epoch = epoch
+        self.q = q
+        self.num_steps = num_steps
         self.D_out = D_out
         self.M_train = M_train
-        self.saving_path = saving_path
-        # self.probs = self.generate_probs()
 
-        ''''''
-        self.G = distribution.Gaussian(mu = 0, sigma = 1)
-        self.alphas = torch.tensor([1 + x / 10.0 for x in range(1, 100)] + list(range(12, 30)))
-        # self.alpha = 3
+        grid = torch.linspace(GRID_EPS, 1 - GRID_EPS, GRID_POINTS, device=DEVICE, dtype=DTYPE)
+        self.log_dt = torch.log(grid[1] - grid[0])
+        self.x = STD_NORMAL.icdf(grid).reshape(1, -1)
 
-        ''''''
-        TN_left = 1e-8
-        TN_right = 1 - TN_left
-        TN_points = int(1e6)
-        self.TN = torch.linspace(TN_left, TN_right, TN_points, device=DEVICE, dtype=dtype_float)
-        self.log_inter_length = torch.log(self.TN[1] - self.TN[0])  # log of the interval length for TN
+        self._set_mixture(self._worst_case_d_out())
 
-        max_rdp = 0
-        d_out_at_max_rdp = None
+    # ---------------------------------------------------------------- mixture
+    def _set_mixture(self, d_out):
+        """Sets ``self.sens`` / ``self.log_w`` to the (truncated) mixture for ``d_out``."""
+        sens = torch.tensor([0, 0.5] + list(range(1, d_out + 1)), device=DEVICE, dtype=DTYPE)
+        log_w = _normalize_log(self._log_weights(d_out), 0)
+        keep = log_w >= LOG_WEIGHT_CUTOFF
+        self.sens, self.log_w = sens[keep], log_w[keep]
 
-        '''the result can be stored in a file, but here we compute it directly'''
-        print(f'Computing RDP for D_out from 1 to {D_out} to find the worst case...')
-        s_time = time.time()
-        for d_out in range(1, D_out + 1):
-            
-            ''''''
-            self.prob_trucate_th = -30
-            self.sens = self.generate_sens(d_out)
-            self.log_prob = self.compute_log_probs(d_out)
+    def _log_weights(self, d_out):
+        """Log mixture weights, aligned with sensitivities ``[0, 1/2, 1, ..., d_out]``."""
+        p = self.q * self.M_train / d_out
+        n = torch.arange(0, d_out + 1, dtype=DTYPE)
+        log_fact = torch.lgamma(n + 1)
+        log_binom = log_fact[-1] - log_fact - log_fact.flip(dims=(0,))
+        log_w = math.log(1 - self.q) + log_binom + n * math.log(p) + (d_out - n) * math.log(1 - p)
+        log_root = torch.tensor([math.log(self.q)], dtype=DTYPE)
+        log_w = torch.cat([log_w[:1], log_root, log_w[1:]]).to(DEVICE)
+        assert torch.all(log_w <= 0), "All entries in log_w should be less or equal to 0"
+        return log_w
 
-            '''normalize log_prob'''
-            self.log_prob = self.normalize_log_prob(self.log_prob, 0)
-            loc = self.log_prob >= self.prob_trucate_th
-            # print(f'loc: {loc.shape}, log_prob: {self.log_prob.shape}, sens: {self.sens.shape}')
-            self.sens = self.sens[loc]
-            self.log_prob = self.log_prob[loc]
-
-            rdp = self.rdp_from_noise_simple(sigma=1, delta=1e-5, show_flag=False)
+    def _worst_case_d_out(self):
+        print(f'Computing RDP for D_out from 1 to {self.D_out} to find the worst case...')
+        start = time.time()
+        max_rdp, worst_d_out = 0, None
+        for d_out in range(1, self.D_out + 1):
+            self._set_mixture(d_out)
+            rdp = self._rdp_one_step(WORST_CASE_ALPHA, self._log_likelihood_ratio(WORST_CASE_SIGMA))
             if rdp > max_rdp:
-                max_rdp = rdp
-                d_out_at_max_rdp = d_out
-            # print(f'D_out = {d_out}, RDP = {rdp:.4f}, max RDP = {max_rdp:.4f}')
-        print(f'Max RDP {max_rdp:.4f} at D_out = {d_out_at_max_rdp}, computation time: {time.time() - s_time:.2f} seconds')
+                max_rdp, worst_d_out = rdp, d_out
+        print(f'Max RDP {max_rdp * self.num_steps:.4f} at D_out = {worst_d_out}, '
+              f'computation time: {time.time() - start:.2f} seconds')
+        return worst_d_out
 
-        self.prob_trucate_th = -30
-        self.sens = self.generate_sens(d_out_at_max_rdp)
-        self.log_prob = self.compute_log_probs(d_out_at_max_rdp)
+    # ------------------------------------------------------------- divergence
+    def _log_likelihood_ratio(self, sigma):
+        """``log P(x) / Q(x)`` on the grid, normalised to integrate to one."""
+        mu = (self.sens / sigma).reshape(-1, 1)
+        log_ratio = torch.logsumexp(0.5 * (2 * self.x - mu) * mu + self.log_w.reshape(-1, 1), dim=0)
+        return _normalize_log(log_ratio, self.log_dt)
 
-        '''normalize log_prob'''
-        self.log_prob = self.normalize_log_prob(self.log_prob, 0)
-        loc = self.log_prob >= self.prob_trucate_th
-        self.sens = self.sens[loc]
-        self.log_prob = self.log_prob[loc]
-        
+    def _rdp_one_step(self, alpha, log_ratio):
+        """``max(D_alpha(P||Q), D_alpha(Q||P))`` for one step."""
+        rdp_q_p = torch.logsumexp(log_ratio * (1 - alpha) + self.log_dt, dim=0) / (alpha - 1)
+        rdp_p_q = torch.logsumexp(log_ratio * alpha + self.log_dt, dim=0) / (alpha - 1)
+        return max(rdp_q_p.item(), rdp_p_q.item())
 
+    # ------------------------------------------------------------- public API
+    def eps_from_noise(self, sigma, delta=1e-5):
+        """``(epsilon, best_alpha)`` after ``num_steps`` steps at noise multiplier ``sigma``."""
+        log_ratio = self._log_likelihood_ratio(sigma)
+        rdp = np.array([self._rdp_one_step(alpha, log_ratio) for alpha in ALPHAS]) * self.num_steps
+        return get_privacy_spent(ALPHAS, rdp, delta)
 
-    def normalize_log_prob(self, log_density, log_interval_length):
+    def noise_from_eps(self, eps, delta=1e-5):
+        """Binary-searches the noise multiplier (to within 0.01) that achieves ``(eps, delta)``.
+
+        Returns the upper end of the final bracket, which is verified to satisfy the budget.
         """
-        Normalize the log probability density function.
-        """
-        log_density = log_density - torch.logsumexp(log_density + log_interval_length, dim=0)
-        return log_density
-
-    def density(self, TN, sigma = None):
-        x = distribution.G.icdf(TN)
-        x = x.reshape(1, -1)
-
-        mu = self.sens / sigma  # Ensure x is a column vector
-        mu = mu.reshape(-1, 1)
-
-        log_prob = self.log_prob.reshape(-1, 1)  # Ensure log_prob is a column vector
-        log_prob = log_prob.repeat(1, x.shape[1])  # Repeat log_prob to match x's shape
-
-        log_den = 0.5 * (2 * x - mu) * mu + log_prob
-        log_den = torch.logsumexp(log_den, dim=0)
-
-        log_den = self.normalize_log_prob(log_den, self.log_inter_length)
-        return log_den
-
-
-    def eps_from_noise(self, sigma, delta = 1e-5, show_flag = True):
-
-
-        def rdp_per_alpha(alpha):
-            log_each_term = self.density(self.TN, sigma) * (1 - alpha) + self.log_inter_length
-            # print(f' shape of log_each_term: {log_each_term.shape}, TN shape: {self.TN.shape}, sigma: {sigma:.8f}')
-            log_each_term = log_each_term.reshape(-1, 1)  # Ensure log_each_term is a column vector
-            log_integral = torch.logsumexp(log_each_term, dim = 0)  # log of the integral
-            rdp = log_integral / (alpha - 1)
-            rdp = rdp.item()  # Convert to scalar
-            # print(f'==> rdp: {rdp:.8f}, alpha: {alpha:.8f}, sigma: {sigma:.8f}')
-
-            log_each_term = self.density(self.TN, sigma) * (alpha) + self.log_inter_length
-            # print(f' shape of log_each_term: {log_each_term.shape}, TN shape: {self.TN.shape}, sigma: {sigma:.8f}')
-            log_each_term = log_each_term.reshape(-1, 1)  # Ensure log_each_term is a column vector
-            log_integral = torch.logsumexp(log_each_term, dim = 0)  # log of the integral
-            rdp_2 = log_integral / (alpha - 1)
-            rdp_2 = rdp_2.item()  # Convert to scalar
-
-            rdp = max(rdp, rdp_2)
-            return rdp * int( self.epoch / self.q_b )
-        
-        orders = self.alphas.cpu().numpy()
-        rdp = np.array([rdp_per_alpha(alpha) for alpha in orders])
-
-        eps, alpha = eps_from_delta_rdp(orders, rdp, delta)
-        return  eps, alpha
-    
-    def rdp_from_noise_simple(self, sigma, delta = 1e-5, show_flag = True):
-
-        alpha = 1.3
-        log_each_term = self.density(self.TN, sigma) * (1 - alpha) + self.log_inter_length
-        # print(f' shape of log_each_term: {log_each_term.shape}, TN shape: {self.TN.shape}, sigma: {sigma:.8f}')
-        log_each_term = log_each_term.reshape(-1, 1)  # Ensure log_each_term is a column vector
-        log_integral = torch.logsumexp(log_each_term, dim = 0)  # log of the integral
-        rdp = log_integral / (alpha - 1)
-        rdp = rdp.item()  # Convert to scalar
-        # print(f'==> rdp: {rdp:.8f}, alpha: {alpha:.8f}, sigma: {sigma:.8f}')
-
-        log_each_term = self.density(self.TN, sigma) * (alpha) + self.log_inter_length
-        # print(f' shape of log_each_term: {log_each_term.shape}, TN shape: {self.TN.shape}, sigma: {sigma:.8f}')
-        log_each_term = log_each_term.reshape(-1, 1)  # Ensure log_each_term is a column vector
-        log_integral = torch.logsumexp(log_each_term, dim = 0)  # log of the integral
-        rdp_2 = log_integral / (alpha - 1)
-        rdp_2 = rdp_2.item()  # Convert to scalar
-
-        rdp = max(rdp, rdp_2)
-        return rdp * int( self.epoch / self.q_b )
-    
-    def noise_from_eps(self, eps, delta = 1e-5, verbose = True):
-        '''return sigma'''
-        '''using binary search'''
-        def calculate():
-            sigma_small = 0.001
-            sigma_large = 100
+        print('privacy accounting...')
+        sigma_small, sigma_large = 0.001, 100.0
+        if self.eps_from_noise(sigma_large, delta)[0] > eps:
+            raise ValueError(f'The privacy budget is too low: sigma = {sigma_large} gives epsilon > {eps}.')
+        while sigma_large - sigma_small > 1e-2:
             sigma = (sigma_small + sigma_large) / 2
-            while sigma_large - sigma_small > 1e-2:
-                tmp_eps, _ = self.eps_from_noise(sigma = sigma, delta = delta, show_flag = False)
-                if tmp_eps > eps:
-                    sigma_small = sigma
-                else:
-                    sigma_large = sigma
-                sigma = (sigma_small + sigma_large) / 2
-            return sigma
-
-        print(f'privacy accounting...')
-        return calculate()
+            if self.eps_from_noise(sigma, delta)[0] > eps:
+                sigma_small = sigma
+            else:
+                sigma_large = sigma
+        return sigma_large
 
 
-    def generate_sens(self, d_out):
-        sens =  torch.tensor(range(d_out+1))
-        sens = sens.tolist()
-        sens = [sens[0], 0.5] + sens[1:]
-        sens = torch.tensor(sens, device = DEVICE, dtype=dtype_float)
-        return sens
-    
-    def compute_log_probs(self, d_out):
-        if d_out == 0:
-             raise ValueError(f'D_out should be greater than 0, but got {d_out}')
-        
-        choosing_prob = self.q_b * self.M_train / d_out #/ np.log(self.D_out + 1)
+def get_std_node_dp(q, num_steps, D_out, M_train, epsilon, delta, cache_dir=None):
+    """Noise multiplier for node-level ``(epsilon, delta)``-DP; cached in ``cache_dir`` if given."""
+    def compute():
+        accountant = NodeDPAccountant(q=q, num_steps=num_steps, D_out=D_out, M_train=M_train)
+        return accountant.noise_from_eps(epsilon, delta)
 
-        ns =  torch.arange(0, d_out + 1, dtype=torch.int32)
-        log_of_factorials = log_factorial(ns)
-        log_of_factorials = log_of_factorials.reshape(-1)
-
-        log_binom = log_of_factorials[-1] - log_of_factorials - log_of_factorials.flip( dims = (0,) ) 
-        log_prob_1 = ns.view(-1) * np.log(choosing_prob)
-        log_prob_2 = (d_out - ns).view(-1) * np.log(1 - choosing_prob)
-        log_prob = np.log(1 - self.q_b) + log_binom + log_prob_1 + log_prob_2
-
-        log_prob = log_prob.reshape(-1).tolist()
-        log_prob = log_prob[:1] + [np.log(self.q_b)] + log_prob[1:]
-        log_prob = torch.tensor(log_prob, device=DEVICE, dtype=dtype_float)
-        assert torch.all(log_prob <= 0), "All entries in log_prob should be less or equal to 0"
-        return log_prob
-
-def check_largest_eps():
-    delta = 1e-5
-    sigma = 2
-
-    comp = divergence_computer(
-            q_b=0.1,
-            epoch=1,
-            D_out=int(1),
-            M_train=1,
-            saving_path=Path(__file__).parent,
-        )
-    eps_1, _ = comp.eps_from_noise(sigma=sigma, delta=delta)
-    print(f'eps for D_out=1: {eps_1:.4f}')
-    max_eps = eps_1
-    
-    for D_out in range(1, 100000):
-        comp = divergence_computer(
-            q_b=0.1,
-            epoch=1,
-            D_out=int(D_out),
-            M_train=1,
-            saving_path=Path(__file__).parent,
-        )
-        eps, _ = comp.eps_from_noise(sigma=sigma, delta=delta)
-        print(f'eps for D_out={D_out}: {eps:.8f}, eps_max: {max_eps:.8f}')
-        ''' if abs() is small, it means converged  '''
-        assert eps >= max_eps or abs(eps - max_eps) < 1e-2, f'eps for D_out={D_out} is smaller than eps for D_out=1'
-        max_eps = max(max_eps, eps)
+    if cache_dir is None:
+        return compute()
+    key = f'q={q!r}|steps={num_steps}|D_out={D_out}|M={M_train}|epsilon={epsilon!r}|delta={delta!r}'
+    return cached_std(Path(cache_dir) / 'node_dp_stds.pt', key, compute)
 
 
 if __name__ == "__main__":
-    ''''''
-    computer = divergence_computer(
-        q_b = 0.2, 
-        epoch = 9,
-        D_out = int(20000), 
-        M_train = 1, 
-        saving_path = Path(__file__).parent,    
-    )
+    accountant = NodeDPAccountant(q=0.2, num_steps=45, D_out=20000, M_train=1)
 
     delta = 1e-5
-    eps, alpha = computer.eps_from_noise(sigma = 1.65, delta = delta)
+    eps, alpha = accountant.eps_from_noise(sigma=1.65, delta=delta)
     print(f'eps: {eps}, alpha: {alpha}')
 
-    eps = 2
-    sigma = computer.noise_from_eps(eps, delta)
-    print(f'sigma: {sigma}')    
-
-    # Check eps for D_out from 1 to 1,000,000 and compare to D_out=1
-    ''''''
-    # check_largest_eps()
+    sigma = accountant.noise_from_eps(2, delta)
+    print(f'sigma: {sigma}')

@@ -1,19 +1,40 @@
-import torch
+"""Baseline: DP-SGD on an MLP over node features only (no graph structure).
+
+Each training node is one record, so standard record-level DP-SGD accounting applies.
+"""
 import time
-import datasets.SETUP as SETUP
+
+import torch
 from torch import nn
-import datasets.utils as dms_utils
+
 import datasets.model as dms_model
-
+import datasets.SETUP as SETUP
+import datasets.utils as dms_utils
+import train_scheduler
 import utils
-import train_scheduler_NaiveDPSGD 
 
 
+def make_mlp(in_dim, num_classes, h_dim):
+    return nn.Sequential(
+        nn.Linear(in_dim, h_dim),
+        nn.ReLU(),
+        nn.Linear(h_dim, h_dim),
+        nn.ReLU(),
+        nn.Linear(h_dim, h_dim),
+        nn.ReLU(),
+        nn.Linear(h_dim, num_classes),
+    )
 
-if __name__ == '__main__':
-    s_time  = time.time()
+
+def make_loader(graph, mask, batch_size, shuffle):
+    dataset = torch.utils.data.TensorDataset(graph.x[mask], graph.y[mask])
+    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                                       num_workers=4, drop_last=False)
+
+
+def main():
     args = utils.get_args()
-    # torch.multiprocessing.set_start_method('spawn')
+    args.graph_setting = 'naive'
     SETUP.setup_seed(args.seed)
     device = SETUP.get_device()
 
@@ -21,63 +42,27 @@ if __name__ == '__main__':
     graph = dataset[0]
     args.num_classes = dataset.num_classes
 
-    ''' dummy var assignment '''
-    args.max_in_degree = 20
-    args.min_out_degree = 10
-    args.num_neighbors = 1
-    args.num_not_neighbors = 1
-    args.graph_setting = 'naive'
-    
-    h_dim = 32
-    if args.dataset == 'Reddit':
-        h_dim = 16
-    model = nn.Sequential(
-                nn.Linear(graph.x.shape[1], h_dim),
-                nn.ReLU(),
-                nn.Linear(h_dim, h_dim),
-                nn.ReLU(),
-                nn.Linear(h_dim, h_dim),
-                nn.ReLU(),
-                nn.Linear(h_dim, args.num_classes)
-            )
+    h_dim = 16 if args.dataset == 'Reddit' else 32
+    model = make_mlp(graph.x.shape[1], args.num_classes, h_dim).to(device)
 
-    model = model.to(device)
+    train_loader = make_loader(graph, split.train_mask, args.expected_batchsize, shuffle=True)
+    train_loader.dataset.graph_data_name = str(dataset)
+    train_loader.dataset.graph_data = graph
+    test_loader = make_loader(graph, split.test_mask, args.expected_batchsize, shuffle=False)
 
-    train_dataset = torch.utils.data.TensorDataset(graph.x[split.train_mask], graph.y[split.train_mask])
-    train_dataset.graph_data_name = str(dataset)
-    train_dataset.graph_data = graph
-    train_loader = torch.utils.data.DataLoader(
-                        train_dataset, 
-                        batch_size=args.expected_batchsize, 
-                        shuffle=True, 
-                        num_workers=4, 
-                        drop_last=False,
-                    )
-    test_dataset = torch.utils.data.TensorDataset(graph.x[split.test_mask], graph.y[split.test_mask])
-    test_loader = torch.utils.data.DataLoader(
-                        test_dataset,
-                        batch_size=args.expected_batchsize,
-                        shuffle=False,
-                        num_workers=4,
-                        drop_last=False,
-                    )
-
-    optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
-    # optimizer = torch.optim.SGD(model.parameters(), lr = 1, momentum=0.9)
-
-    # worker_model_func, worker_param_func, worker_buffers_func = make_functional_with_buffers(deepcopy(model), disable_autograd_tracking=True)
-
-    train_scheduler = train_scheduler_NaiveDPSGD.trainer(
-        model = model,
-        optimizer = optimizer,
-        loaders = [train_loader, None, test_loader],
-        device = device,
-        criterion = dms_model.criterion,
-        args = args,
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    trainer = train_scheduler.NaiveDPSGDTrainer(
+        model=model,
+        optimizer=optimizer,
+        loaders=[train_loader, None, test_loader],
+        device=device,
+        criterion=dms_model.criterion,
+        args=args,
     )
-    
-    train_scheduler.run()
-
-    print(f'\n==> ToTaL TiMe FoR OnE RuN: {time.time() - s_time:.4f}\n\n\n')
+    trainer.run()
 
 
+if __name__ == '__main__':
+    start = time.time()
+    main()
+    print(f'\n==> ToTaL TiMe FoR OnE RuN: {time.time() - start:.4f}\n\n\n')

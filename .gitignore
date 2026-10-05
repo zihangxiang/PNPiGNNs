@@ -1,0 +1,7 @@
+__pycache__/
+# datasets and caches
+GRAPH_DATA/
+Preserving_Node_level_Privacy_in_Graph_Neural_Networks/privacy/stds.pt
+# run outputs
+Preserving_Node_level_Privacy_in_Graph_Neural_Networks/logs/
+Preserving_Node_level_Privacy_in_Graph_Neural_Networks/data_records/
